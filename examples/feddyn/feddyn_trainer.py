@@ -6,41 +6,50 @@ from plato.trainers import basic
 import copy
 import os
 import numpy as np
-class Trainer(basic.Trainer):
 
-    def perform_forward_and_backward_passes(self, config, examples, labels, alpha_coef, avg_mdl_param, local_grad_vector):
-        """Perform forward and backward passes in the training loop. """
+
+class Trainer(basic.Trainer):
+    def perform_forward_and_backward_passes(
+        self, config, examples, labels, alpha_coef, avg_mdl_param, local_grad_vector
+    ):
+        """Perform forward and backward passes in the training loop."""
 
         model = self.model.to(self.device)
-        loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
-        
+        loss_fn = torch.nn.CrossEntropyLoss(reduction="sum")
+
         self.optimizer.zero_grad()
 
         batch_x = examples.to(self.device)
         batch_y = labels.to(self.device)
-        
+
         y_pred = model(batch_x)
-        
-        ## Get f_i estimate 
+
+        ## Get f_i estimate
         loss_f_i = loss_fn(y_pred, batch_y.reshape(-1).long())
         loss_f_i = loss_f_i / list(batch_y.size())[0]
-        
+
         # Get linear penalty on the current parameter estimates
         local_par_list = None
         for param in model.parameters():
             if not isinstance(local_par_list, torch.Tensor):
-            # Initially nothing to concatenate
+                # Initially nothing to concatenate
                 local_par_list = param.reshape(-1)
             else:
                 local_par_list = torch.cat((local_par_list, param.reshape(-1)), 0)
-        
-        loss_algo = alpha_coef * torch.sum(local_par_list * (-avg_mdl_param + local_grad_vector))
+        loss_algo = torch.tensor(alpha_coef * 0).to(loss_f_i.device)
+        if not local_grad_vector == 0:
+            for avg_param, local_param in zip(avg_mdl_param, local_grad_vector):
+                loss_algo = torch.tensor(alpha_coef).to(loss_f_i.device) * torch.sum(
+                    local_par_list * (-avg_param + local_param)
+                )
+        loss_algo = torch.mean(loss_algo)
         loss = loss_f_i + loss_algo
-
+        loss.backward()
         self.optimizer.step()
-        
+        self._loss_tracker.update(loss, labels.size(0))
+
         return loss
-    
+
     def train_model(self, config, trainset, sampler, **kwargs):
         """The default training loop when a custom training loop is not supplied."""
         batch_size = config["batch_size"]
@@ -80,31 +89,35 @@ class Trainer(basic.Trainer):
                 )
 
                 examples, labels = examples.to(self.device), labels.to(self.device)
-                
+
+                if not self.model_state_dict:
+                    self.model_state_dict = self.model.state_dict()
                 cld_mdl_param = []
-                if(self.model_state_dict):
+                if self.model_state_dict:
                     cld_mdl_param = copy.deepcopy(self.model_state_dict)
-                cld_mdl_param_tensor = torch.tensor(cld_mdl_param, dtype=torch.float32, device=self.device)
 
-
-                model_path = Config().params["model_path"] 
+                model_path = Config().params["model_path"]
                 filename = f"{model_path}_{self.client_id}.pth"
                 local_param_list = []
-                if(self.model_state_dict):
-                    local_param_list = np.zeros(len(self.model_state_dict)).astype('float32')
-                if(os.path.exists(filename)):
+                if self.model_state_dict:
+                    local_param_list = 0
+                if os.path.exists(filename):
                     local_model = torch.load(filename)
-                    local_param_list = copy.deepcopy(local_model.model_state_dict)
-                local_param_list_tensor = torch.tensor(local_param_list, dtype=torch.float32, device=self.device)
+                    local_param_list = copy.deepcopy(local_model.state_dict())
 
-
-                clnt_y = labels;
+                clnt_y = labels.cpu().numpy()
                 weight_list = clnt_y / np.sum(clnt_y) * n_clnt
-                weight_list = weight_list.cpu().numpy()
-                alpha_coef_adpt = alpha_coef / np.where(weight_list != 0, weight_list, 1.0)
-                
+                alpha_coef_adpt = alpha_coef / np.where(
+                    weight_list != 0, weight_list, 1.0
+                )
+
                 loss = self.perform_forward_and_backward_passes(
-                    config, examples, labels, alpha_coef_adpt, cld_mdl_param_tensor, local_param_list_tensor
+                    config,
+                    examples,
+                    labels,
+                    alpha_coef_adpt,
+                    cld_mdl_param,
+                    local_param_list,
                 )
 
                 self.train_step_end(config, batch=batch_id, loss=loss)
@@ -133,7 +146,7 @@ class Trainer(basic.Trainer):
                 and Config().server.request_update
             ):
                 self.model.cpu()
-                model_path = Config().params["model_path"] 
+                model_path = Config().params["model_path"]
                 filename = f"{model_path}_{self.client_id}.pth"
                 self.save_model(filename)
                 self.model.to(self.device)
